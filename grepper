@@ -2,9 +2,10 @@
 #
 # grepper
 #
-# TODO 圧縮ファイル/バイナリファイル
+# TODO バイナリファイル
 # TODO ファイルリストが遅い
 # TODO 出力入れ替え
+
 function private.print_usage() {
 cat << __EOF__ >&2
 usage: $(basename $0) [-h -c -v -q -l -ic]
@@ -21,6 +22,8 @@ parameters:
   -l|--link                    シンボリックリンクを対象にする
   -ic|--ignorecase             大文字小文字を区別しない
   -esc|--escapecsv             csvファイルをエスケープする
+  -sa|--searcharchive          圧縮ファイルを検索対象とする
+                               対象：$(private.support_archives | sed -e 's#application/##g')
   [file path search options]
   -fm|--filemtime              +n日以前に更新された|n日前に更新された|-n日前までに更新された
   -fmm|--filemmin              +n分以前に更新された|n分前に更新された|-n分前までに更新された
@@ -46,12 +49,12 @@ examples:
 __EOF__
 }
 function private.escape() {
-  TARGET="$1"
+  local TARGET="$1"
   # 終端のバックスラッシュが存在する場合
   echo "${TARGET}" | grep -q '\\$'
   if [ $? -eq 0 ]; then
     # rev で逆順にして、終端からの最長マッチをする
-    COUNT=$(echo "${TARGET}" | rev | sed -e 's/^\(\\\\*\).*$/\1/' | tr -d '\n' | wc -c | sed 's/ //g')
+    local COUNT=$(echo "${TARGET}" | rev | sed -e 's/^\(\\\\*\).*$/\1/' | tr -d '\n' | wc -c | sed 's/ //g')
     # 奇数の場合は偶数にする
     if [ ${COUNT} -ne 0 -a $(expr ${COUNT} % 2) -eq 1 ]; then
       TARGET=$(echo "$TARGET" | sed 's/\\$/\\\\/')
@@ -63,7 +66,7 @@ function private.escape() {
   echo "${TARGET}" | sed -e "s/^/'/" -e "s/$/'/"
 }
 function private.escape_regex() {
-  TARGET="$1"
+  local TARGET="$1"
   # .^$|\[]
   # メタ文字が存在する場合
   echo "${TARGET}" | grep -q -e '[\.^$]' -e '\[' -e '\]'
@@ -73,44 +76,36 @@ function private.escape_regex() {
   fi
   echo "${TARGET}"
 }
-function private.create_ignore_grep_command() {
-  CONDITION="$1"
-  FILTER_COMMAND=""
-  if [ "${CONDITION}" != "" ]; then
-    for CONDITION_WORD in $(echo "${CONDITION}" | sed "s/[\]|/${DELIM}/g"); do
-      if [ "$(echo ${CONDITION_WORD} | cut -c1)" = ${FIXED_COMMAND} ]; then
-        CONDITION_WORD="$(echo ${CONDITION_WORD} | cut -c2-)"
-        CONDITION_WORD=$(private.escape_regex "${CONDITION_WORD}")
-      fi
-      FILTER_COMMAND="${FILTER_COMMAND} | grep ${IGNORE_CASE} -v "$(private.escape "${CONDITION_WORD}")
-    done
-  fi
-  echo ${FILTER_COMMAND}
+function private.create_find_command(){
+  local FIND_PATHS="$1"
+  echo "find ${FOLLOW_SYMLINK} $(echo ${FIND_PATHS} | sed 's/[\]|/ /g') -type f ${FILE_NAME} ${FILE_TIME}"
 }
-function private.create_contents_ignore_grep_command() {
-  CONDITION="$1"
-  FILTER_COMMAND=""
+function private.create_ignore_grep_command() {
+  local CONDITION="$1"
+  local FILTER_PREFIX_PATTERN="$2"
+  local FILTER_COMMAND=""
   if [ "${CONDITION}" != "" ]; then
     for CONDITION_WORD in $(echo "${CONDITION}" | sed "s/[\]|/${DELIM}/g"); do
       if [ "$(echo ${CONDITION_WORD} | cut -c1)" = ${FIXED_COMMAND} ]; then
         CONDITION_WORD="$(echo ${CONDITION_WORD} | cut -c2-)"
         CONDITION_WORD=$(private.escape_regex "${CONDITION_WORD}")
       fi
-      FILTER_COMMAND="${FILTER_COMMAND} | grep ${IGNORE_CASE} -v "$(private.escape "^[0-9][0-9]*:.*${CONDITION_WORD}")
+      FILTER_COMMAND="${FILTER_COMMAND} | grep ${IGNORE_CASE} -v "$(private.escape "${FILTER_PREFIX_PATTERN}${CONDITION_WORD}")
     done
   fi
   echo ${FILTER_COMMAND}
 }
 function private.create_grep_command() {
-  CONDITION="$1"
-  GREP_ADDITIONAL_OPT="$2"
-  FILTER_COMMAND=""
+  local CONDITION="$1"
+  local GREP_ADDITIONAL_OPT="$2"
+  local FILTER_PREFIX_PATTERN="$3"
+  local FILTER_COMMAND=""
   if [ "${CONDITION}" != "" ]; then
     for CONDITION_WORD in $(echo "${CONDITION}" | sed -e "s/[\],/${DELIM}/g"); do
       echo "${CONDITION_WORD}" | grep -q "[\]|"
       if [ $? -eq 0 ]; then
-        GREP_OPT=""
-        IS_FIXED=
+        local GREP_OPT=""
+        local IS_FIXED=
         if [ "$(echo ${CONDITION_WORD} | cut -c1)" = ${FIXED_COMMAND} ]; then
           CONDITION_WORD="$(echo ${CONDITION_WORD} | cut -c2-)"
           IS_FIXED=true
@@ -119,7 +114,7 @@ function private.create_grep_command() {
           if [ "${IS_FIXED}" = "true" ]; then
             OR=$(private.escape_regex "${OR}")
           fi
-          GREP_OPT="${GREP_OPT} -e "$(private.escape "${OR}")
+          GREP_OPT="${GREP_OPT} -e "$(private.escape "${FILTER_PREFIX_PATTERN}${OR}")
         done
         FILTER_COMMAND="${FILTER_COMMAND} | grep ${IGNORE_CASE} ${GREP_ADDITIONAL_OPT} ${GREP_OPT}"
       else
@@ -127,52 +122,20 @@ function private.create_grep_command() {
           CONDITION_WORD="$(echo ${CONDITION_WORD} | cut -c2-)"
           CONDITION_WORD=$(private.escape_regex "${CONDITION_WORD}")
         fi
-        FILTER_COMMAND="${FILTER_COMMAND} | grep ${IGNORE_CASE} ${GREP_ADDITIONAL_OPT} "$(private.escape "${CONDITION_WORD}")
-      fi
-    done
-  fi
-  echo ${FILTER_COMMAND}
-}
-function private.create_contents_grep_command() {
-  CONDITION="$1"
-  GREP_OPT=""
-  FILTER_COMMAND=""
-  if [ "${CONDITION}" != "" ]; then
-    for CONDITION_WORD in $(echo "${CONDITION}" | sed "s/[\],/${DELIM}/g"); do
-      echo "${CONDITION_WORD}" | grep -q "[\]|"
-      if [ $? -eq 0 ]; then
-        GREP_OPT=""
-        IS_FIXED=
-        if [ "$(echo ${CONDITION_WORD} | cut -c1)" = ${FIXED_COMMAND} ]; then
-          CONDITION_WORD="$(echo ${CONDITION_WORD} | cut -c2-)"
-          IS_FIXED=true
-        fi
-        for OR in $(echo "${CONDITION_WORD}" | sed "s/[\]|/${DELIM}/g"); do
-          if [ "${IS_FIXED}" = "true" ]; then
-            OR=$(private.escape_regex "${OR}")
-          fi
-          GREP_OPT="${GREP_OPT} -e "$(private.escape "^[0-9][0-9]*:.*${OR}")
-        done
-        FILTER_COMMAND="${FILTER_COMMAND} | grep ${IGNORE_CASE} ${GREP_OPT}"
-      else
-        if [ "$(echo ${CONDITION_WORD} | cut -c1)" = ${FIXED_COMMAND} ]; then
-          CONDITION_WORD="$(echo ${CONDITION_WORD} | cut -c2-)"
-          CONDITION_WORD=$(private.escape_regex "${CONDITION_WORD}")
-        fi
-        FILTER_COMMAND="${FILTER_COMMAND} | grep ${IGNORE_CASE} "$(private.escape "^[0-9][0-9]*:.*${CONDITION_WORD}")
+        FILTER_COMMAND="${FILTER_COMMAND} | grep ${IGNORE_CASE} ${GREP_ADDITIONAL_OPT} "$(private.escape "${FILTER_PREFIX_PATTERN}${CONDITION_WORD}")
       fi
     done
   fi
   echo ${FILTER_COMMAND}
 }
 function private.output_path_info() {
-  COLOR_FILE=""
-  COLOR_TIME=""
-  COLOR_SIZE=""
-  COLOR_USER=""
-  COLOR_PERM=""
-  COLOR_END=""
-  if [ "${2}" != "" ]; then
+  local COLOR_FILE=""
+  local COLOR_TIME=""
+  local COLOR_SIZE=""
+  local COLOR_USER=""
+  local COLOR_PERM=""
+  local COLOR_END=""
+  if [ "${GREPPER_COLOR}" != "" ]; then
     COLOR_FILE=$(echo -e '\033[32m')
     COLOR_TIME=$(echo -e '\033[33m')
     COLOR_SIZE=$(echo -e '\033[34m')
@@ -180,7 +143,7 @@ function private.output_path_info() {
     COLOR_PERM=$(echo -e '\033[36m')
     COLOR_END=$(echo -e '\033[0m')
   fi
-  FILE_TIME=$(date -r "${1}" '+%Y/%m/%d %H:%M:%S')
+  local FILE_TIME=$(date -r "${1}" '+%Y/%m/%d %H:%M:%S')
   if [ $(uname) = "Darwin" ]; then
     # Mac
     # 1            2 3          4      5      6 7  8     9
@@ -194,10 +157,10 @@ function private.output_path_info() {
   fi
 }
 function private.output_file_info() {
-  COLOR_FILE=""
-  COLOR_LINE=""
-  COLOR_END=""
-  if [ "${3}" != "" ]; then
+  local COLOR_FILE=""
+  local COLOR_LINE=""
+  local COLOR_END=""
+  if [ "${GREPPER_COLOR}" != "" ]; then
     COLOR_FILE=$(echo -e '\033[32m')
     COLOR_LINE=$(echo -e '\033[34m')
     COLOR_END=$(echo -e '\033[0m')
@@ -209,9 +172,9 @@ function private.output_file_info() {
   fi
 }
 function private.left() {
-  COUNT=$(echo -n "${1}" | wc -c | sed 's/ //g' | tr -d '\n')
+  local COUNT=$(echo -n "${1}" | wc -c | sed 's/ //g' | tr -d '\n')
   if [ ${COUNT} -gt ${2} ]; then
-    CUT_OPT=$(printf " -c%d-" $(expr ${COUNT} - ${2} + 1) | sed 's/ //g')
+    local CUT_OPT=$(printf " -c%d-" $(expr ${COUNT} - ${2} + 1) | sed 's/ //g')
     printf "%-${2}.${2}s" $(echo "${1}" | cut ${CUT_OPT})
   else
     printf "%-${2}.${2}s" "${1}"
@@ -224,7 +187,7 @@ function private.console() {
 }
 function private.console_printf() {
   if [ "${QUIET}" != "true" -a "${VERBOSE}" = "true" ]; then
-    LINE=$(printf "$@")
+    local LINE=$(printf "$@")
     echo -en "${LINE}" >&2
   fi
 }
@@ -239,22 +202,194 @@ function private.is_numeric() {
     echo "false"
   fi
 }
+function private.support_archives(){
+  local ARCHIVES=""
+  local SEP=""
+  if [ "$(which unzip)" != "" ]; then
+    ARCHIVES="application/zip,application/java-archive"
+    SEP=","
+  fi
+  if [ "$(which gzip)" != "" ]; then
+    ARCHIVES="${ARCHIVES}${SEP}application/x-gzip"
+    SEP=","
+  fi
+  if [ "$(which bzip2)" != "" ]; then
+    ARCHIVES="${ARCHIVES}${SEP}application/x-bzip2"
+    SEP=","
+  fi
+  if [ "$(which pax)" != "" ]; then
+    ARCHIVES="${ARCHIVES}${SEP}application/x-tar"
+    SEP=","
+  fi
+  if [ "$(which 7zr)" != "" ]; then
+    ARCHIVES="${ARCHIVES}${SEP}application/x-7z-compressed"
+  fi
+  echo ${ARCHIVES}
+}
+function private.is_supported_type(){
+  for ARCHIVE in $(private.support_archives | sed "s/,/${DELIM}/g"); do
+    if [ "$1" = "${ARCHIVE}" ]; then
+      echo "true"
+      return
+    fi
+  done
+  echo "false"
+}
+function private.extract_file(){
+  local FILE=$1
+  local FILE_INFO=$2
+  local EXTRACTED_ROOT=$3
+  private.console ""
+  private.console "extract[${FILE_INFO}]: ${FILE}"
+  if [ "${FILE_INFO}" = "application/zip" \
+       -o "${FILE_INFO}" = "application/java-archive" ]; then
+    unzip -o "${FILE}" -d "${EXTRACTED_ROOT}" > /dev/null
+  elif [ "${FILE_INFO}" = "application/x-gzip" ]; then
+    EXTRACTED_ROOT="${EXTRACTED_ROOT}/data"
+    gzip --decompress "${FILE}" --stdout > "${EXTRACTED_ROOT}"
+  elif [ "${FILE_INFO}" = "application/x-bzip2" ]; then
+    EXTRACTED_ROOT="${EXTRACTED_ROOT}/data"
+    bzip2 --decompress "${FILE}" --stdout > "${EXTRACTED_ROOT}"
+  elif [ "${FILE_INFO}" = "application/x-tar" ]; then
+    # 絶対パスを除去して解凍する
+    ( cd "${EXTRACTED_ROOT}" && pax -rvs '#^/#./#' -f "${FILE}" > /dev/null 2>&1)
+  elif [ "${FILE_INFO}" = "application/x-7z-compressed" ]; then
+    EXTRACTED_ROOT="${EXTRACTED_ROOT}/data"
+    7zr x -so "${FILE}" > "${EXTRACTED_ROOT}"
+  fi
+  echo "${EXTRACTED_ROOT}"  
+}
+private.grepper(){
+  local DEPTH="$1"
+  local OUTPUT_PATH_FILE="$2"
+  local OUTPUT_FILE="$3"
+  local FIND_PATHS="$4"
+  local ARCHIVE_ROOT="$5"
+  local REPLACE_FIND_PATHS="$6"
+  
+  local TMP_OUTPUT_PATH_FILE="${OUTPUT_PATH_FILE}_${DEPTH}"
+  local TMP_OUTPUT_FILE="${OUTPUT_FILE}_${DEPTH}"
+  if [ -f "${TMP_OUTPUT_PATH_FILE}" ]; then rm "${TMP_OUTPUT_PATH_FILE}"; fi
+  if [ -f "${TMP_OUTPUT_FILE}" ]; then rm "${TMP_OUTPUT_FILE}"; fi
+  touch "${TMP_OUTPUT_PATH_FILE}"
+  touch "${TMP_OUTPUT_FILE}"
+
+  local SEARCH_COMMAND=$(private.create_find_command "${FIND_PATHS}")" ${FILE_FILTER}"
+
+  local OUTPUT_PATH_LIST=${TMP_DIR}/grepper.list_${DEPTH}
+  # 対象ファイルの検索
+  ( eval ${SEARCH_COMMAND} ) > ${OUTPUT_PATH_LIST}
+  if [ \( $? -ne 0 \) -a \( $? -ne 1 \) ]; then
+    private.console_error "ファイル検索に失敗しました。"
+    exit 6
+  fi
+  local FILE_COUNT=0
+  local FILES_COUNT=$(cat ${OUTPUT_PATH_LIST} | wc -l | sed 's/ //g')
+  # 戻り値設定
+  local RETCODE=3
+
+  # 検索されたファイルごとにファイル内を検索
+  for FILE in $(cat ${OUTPUT_PATH_LIST} | tr "\n" "${DELIM}"); do
+    FILE=$(cd $(dirname "${FILE}");pwd)/$(basename ${FILE})
+    # 状況表示
+    local FILE_COUNT=$(expr ${FILE_COUNT} + 1)
+    private.console_printf "%${DEPTH}.${DEPTH}s %05d/%05d - %s\r" "" ${FILE_COUNT} ${FILES_COUNT} "$(private.left ${FILE} 60)"
+    if [ "${FILTER_IN_FILE_COMMAND}" != "" ]; then
+      # ファイル内検索コマンドが指定されている場合
+      FILE_INFO=$(file -b --mime-type "${FILE}" | sed 's/ //g')
+      case "${FILE_INFO}" in
+      text/*)
+        ;;
+      application/xml)
+        ;;
+      *)
+        if [ "${SEARCH_COMPRESSED}" = "true" ]; then
+          if [ "$(private.is_supported_type ${FILE_INFO})" = "true" ]; then
+            # 解凍する
+            EXTRACTED_ROOT="${TMP_DIR}/extract_${DEPTH}"
+            if [ -d "${EXTRACTED_ROOT}" ]; then rm -r "${EXTRACTED_ROOT}"; fi
+            mkdir -p "${EXTRACTED_ROOT}"
+            EXTRACTED_NEW_ROOT=$(private.extract_file "${FILE}" "${FILE_INFO}" "${EXTRACTED_ROOT}")
+            # 再帰呼出し
+            private.grepper $(expr ${DEPTH} + 1) "${OUTPUT_PATH_FILE}" "${OUTPUT_FILE}" "${EXTRACTED_ROOT}" "${FILE}" "${EXTRACTED_NEW_ROOT}"
+            rm -r "${EXTRACTED_ROOT}"
+          else
+            private.console "[skip] ${FILE_INFO} - ${FILE}"
+            :
+          fi
+        else
+          private.console "[skip] ${FILE_INFO} - ${FILE}"
+          :
+        fi
+        continue
+        ;;
+      esac
+      # 行番号付きで検索した結果をフィルタする
+      TMP_FILE=${TMP_DIR}/grepper.tmp_${DEPTH}
+      ( eval "cat '${FILE}' | grep -n '.*' "${FILTER_IN_FILE_COMMAND} ) > ${TMP_FILE}
+      COUNT=$(cat ${TMP_FILE} | wc -l | sed 's/ //g')
+      if [ ${COUNT} -ne 0 ]; then
+        # ファイル検索結果が存在する
+        RETCODE=0
+        # ファイルを分解して色付け
+        if [ "${GREPPER_COLOR}" != "" ]; then
+          TMP_FILE_1=${TMP_DIR}/grepper.tmp1_${DEPTH}
+          TMP_FILE_2=${TMP_DIR}/grepper.tmp2_${DEPTH}
+          # 行番号に色がつかないよう分解する
+          sed 's#^\([^:]*\):.*$#\1#' ${TMP_FILE} > ${TMP_FILE_1}
+          eval "sed 's#^[^:]*:\(.*\)\$#\1#' ${TMP_FILE} ${FILTER_COLOR_COMMAND}" > ${TMP_FILE_2}
+          if [ $(cat ${TMP_FILE_1} | wc -l | sed 's/ //g') = $(cat ${TMP_FILE_2} | wc -l | sed 's/ //g') ]; then
+            paste -d: ${TMP_FILE_1} ${TMP_FILE_2} > ${TMP_FILE}
+          else
+            # FIXME grep --color=always -e OR -e OR の場合、segfaultで落ちる...
+            private.console_error "色付けに失敗[${FILE}]"
+          fi
+        fi
+        # 検索条件に該当する行あり
+        private.output_file_info "${FILE}" "${TMP_FILE}" >> ${TMP_OUTPUT_FILE}
+      fi
+    else
+      # パス検索結果が存在する
+      RETCODE=0
+      # ファイル内検索なし
+      private.output_path_info "${FILE}" >> ${TMP_OUTPUT_PATH_FILE}
+    fi
+  done
+  
+  if [ "${DEPTH}" = "0" ]; then
+    cat ${TMP_OUTPUT_PATH_FILE} >> ${OUTPUT_PATH_FILE}
+    cat ${TMP_OUTPUT_FILE} >> ${OUTPUT_FILE}
+  else
+    REPLACE="${FIND_PATHS}"
+    # gzip | bzip2 で一時展開した data を除去する
+    if [ "${FIND_PATHS}" != "${REPLACE_FIND_PATHS}" ]; then
+      REPLACE="${REPLACE_FIND_PATHS}"
+    fi
+    cat ${TMP_OUTPUT_PATH_FILE} | sed "s#${REPLACE}#${ARCHIVE_ROOT}#g" >> ${OUTPUT_PATH_FILE}_$(expr ${DEPTH} - 1)
+    cat ${TMP_OUTPUT_FILE} | sed "s#${REPLACE}#${ARCHIVE_ROOT}#g" >> ${OUTPUT_FILE}_$(expr ${DEPTH} - 1)
+  fi
+  return ${RETCODE}
+}
+
+#---------------------------------------------------
+# main
+#---------------------------------------------------
+
+# 固定値検索判別のため、\a[ベル]を利用する
 FIXED_COMMAND=$(echo -e "\a")
 # 空白が除去されないように、IFSを \v[垂直タブ]にする
 DELIM=$(echo -e "\v\n")
 IFS="${DELIM}"
+
 # Conditions
 IGNORE_FILE=""
 MATCH_FILE=""
 IGNORE_IN_FILE=""
 MATCH_IN_FILE=""
 FIND_PATHS=""
-FILE_NAME=""
-FILE_TIME=""
-GREP_COLOR=""
 # stdoutが端末かどうか判定
 if [ -t 1 ]; then
-  GREP_COLOR="--color=always"
+  export GREPPER_COLOR="--color=always"
 fi
 # 引数解析
 while [ $# -gt 0 ]; do
@@ -267,7 +402,7 @@ while [ $# -gt 0 ]; do
       private.console_error "数値を指定してください。[$1]"
       exit 6
     fi
-    FILE_TIME=" -mtime ${1}"
+    export FILE_TIME="-mtime ${1}"
     shift
     ;;
   -fmm|--filemmin)
@@ -277,7 +412,7 @@ while [ $# -gt 0 ]; do
       private.console_error "数値を指定してください。[$1]"
       exit 6
     fi
-    FILE_TIME=" -mmin ${1}"
+    export FILE_TIME="-mmin ${1}"
     shift
     ;;
   -fi|--fileignore)
@@ -324,7 +459,7 @@ while [ $# -gt 0 ]; do
     if [ "${FILE_NAME}" != "" ]; then
       SEP=" -o "
     fi
-    FILE_NAME="${FILE_NAME}${SEP}-name '$1'"
+    export FILE_NAME="${FILE_NAME}${SEP}-name '$1'"
     shift
     ;;
   -fs|--filesuffix)
@@ -378,7 +513,7 @@ while [ $# -gt 0 ]; do
     shift
     ;;
   -c|--color)
-    GREP_COLOR="--color=always"
+    export GREPPER_COLOR="--color=always"
     shift
     ;;
   -v|--verbose)
@@ -391,9 +526,9 @@ while [ $# -gt 0 ]; do
     ;;
   -l|--link)
     if [ $(uname) = "Darwin" ]; then
-      FOLLOW_SYMLINK=" -L"
+      FOLLOW_SYMLINK="-L"
     else
-      FOLLOW_SYMLINK=" -follow"
+      FOLLOW_SYMLINK="-follow"
     fi
     shift
     ;;
@@ -403,6 +538,10 @@ while [ $# -gt 0 ]; do
     ;;
   -esc|--escapecsv)
     export ESCAPE_CSV=true
+    shift
+    ;;
+  -sa|--searcharchive)
+    export SEARCH_COMPRESSED=true
     shift
     ;;
   -h|--help)
@@ -424,40 +563,24 @@ if [ "${FIND_PATHS}" = "" ]; then
   exit 6
 fi
 for FIND_PATH in $(echo ${FIND_PATHS} | sed "s/[\]|/${DELIM}/g"); do
-  if [ ! -d "${FIND_PATH}" ]; then
+  if [ ! -d "${FIND_PATH}" -a \
+       ! -f "${FIND_PATH}" ]; then
     private.print_usage
-    private.console_error "ディレクトリが存在しません。[${FIND_PATH}]"
+    private.console_error "ファイル/ディレクトリが存在しません。[${FIND_PATH}]"
     exit 6
   fi
 done
-# 中間ファイル
-OUTPUT_PATH_LIST=/tmp/grepper.list.$$
-OUTPUT_PATH_FILE=/tmp/grepper.path.$$.csv
-OUTPUT_FILE=/tmp/grepper.file.$$.csv
-TMP_FILE=/tmp/grepper.tmp.$$
-TMP_FILE_1=/tmp/grepper.tmp1.$$
-TMP_FILE_2=/tmp/grepper.tmp2.$$
-# 初期化
-cat /dev/null > ${OUTPUT_PATH_FILE}
-cat /dev/null > ${OUTPUT_FILE}
-# 処理終了時に削除
-trap "if [ -f ${OUTPUT_PATH_LIST} ]; then rm ${OUTPUT_PATH_LIST}; fi; \
-      if [ -f ${OUTPUT_PATH_FILE} ]; then rm ${OUTPUT_PATH_FILE}; fi; \
-      if [ -f ${OUTPUT_FILE} ]; then rm ${OUTPUT_FILE}; fi; \
-      if [ -f ${TMP_FILE_1} ]; then rm ${TMP_FILE_1}; fi; \
-      if [ -f ${TMP_FILE_2} ]; then rm ${TMP_FILE_2}; fi; \
-      if [ -f ${TMP_FILE} ]; then rm ${TMP_FILE}; fi" EXIT
+
 # FINDコマンドの組み立て
-SEARCH_COMMAND="find ${FOLLOW_SYMLINK} $(echo ${FIND_PATHS} | sed 's/[\]|/ /g') -type f ${FILE_NAME}${FILE_TIME}"
+SEARCH_COMMAND=$(private.create_find_command "${FIND_PATHS}")
 # ファイル名フィルタコマンドの作成
-FILTER_COMMAND=$(private.create_ignore_grep_command "${IGNORE_FILE}")
-FILTER_COMMAND="${FILTER_COMMAND}"$(private.create_grep_command "${MATCH_FILE}")
-# 生成したコマンドを元に、ファイル内を検索する
-COMMAND="${SEARCH_COMMAND} ${FILTER_COMMAND}"
+FILE_FILTER=$(private.create_ignore_grep_command "${IGNORE_FILE}")
+export FILE_FILTER="${FILE_FILTER}"$(private.create_grep_command "${MATCH_FILE}")
 # 行番号を考慮したファイル内検索コマンド生成
-FILTER_IN_FILE_COMMAND=$(private.create_contents_ignore_grep_command "${IGNORE_IN_FILE}")
-FILTER_IN_FILE_COMMAND=${FILTER_IN_FILE_COMMAND}$(private.create_contents_grep_command "${MATCH_IN_FILE}")
-FILTER_COLOR_COMMAND=$(private.create_grep_command "${MATCH_IN_FILE}" "${GREP_COLOR}")
+FILTER_IN_FILE_COMMAND=$(private.create_ignore_grep_command "${IGNORE_IN_FILE}" "^[0-9][0-9]*:.*")
+export FILTER_IN_FILE_COMMAND="${FILTER_IN_FILE_COMMAND}"$(private.create_grep_command "${MATCH_IN_FILE}" "" "^[0-9][0-9]*:.*")
+export FILTER_COLOR_COMMAND=$(private.create_grep_command "${MATCH_IN_FILE}" "${GREPPER_COLOR}")
+
 private.console "== params ================================================================="
 private.console "検索対象パス　　　　　: ${FIND_PATHS}"
 private.console "対象日時              : ${FILE_TIME}"
@@ -467,9 +590,10 @@ private.console "ファイル名検索パターン: ${MATCH_FILE}"
 private.console "ファイル内除外パターン: ${IGNORE_IN_FILE}"
 private.console "ファイル内検索パターン: ${MATCH_IN_FILE}"
 private.console "== command ================================================================"
-private.console "ファイル名検索コマンド: ${COMMAND}"
+private.console "ファイル名検索コマンド: ${SEARCH_COMMAND} ${FILE_FILTER}"
 private.console "ファイル内検索コマンド: ${FILTER_COLOR_COMMAND}"
 private.console "==========================================================================="
+
 # フィルタの動作確認
 if [ "${FILTER_IN_FILE_COMMAND}" != "" ]; then
   (eval cat /dev/null ${FILTER_IN_FILE_COMMAND}) > /dev/null
@@ -478,64 +602,23 @@ if [ "${FILTER_IN_FILE_COMMAND}" != "" ]; then
     exit 6
   fi
 fi
-# 対象ファイルの検索
-( eval ${COMMAND} ) > ${OUTPUT_PATH_LIST}
-if [ \( $? -ne 0 \) -a \( $? -ne 1 \) ]; then
-  private.console_error "ファイル検索に失敗しました。"
-  exit 6
-fi
-FILE_COUNT=0
-FILES_COUNT=$(cat ${OUTPUT_PATH_LIST} | wc -l | sed 's/ //g')
-# 戻り値設定
-RETCODE_PATH=3
-RETCODE_FILE=3
-# 検索されたファイルごとにファイル内を検索
-for FILE in $(cat ${OUTPUT_PATH_LIST} | tr "\n" "${DELIM}"); do
-  # パス検索結果が存在する
-  RETCODE_PATH=0
-  FILE=$(cd $(dirname "${FILE}");pwd)/$(basename ${FILE})
-  # 状況表示
-  FILE_COUNT=$(expr ${FILE_COUNT} + 1)
-  private.console_printf " %05d/%05d - %s\r" ${FILE_COUNT} ${FILES_COUNT} "$(private.left ${FILE} 60)"
-  if [ "${FILTER_IN_FILE_COMMAND}" != "" ]; then
-    # ファイル内検索コマンドが指定されている場合
-    FILE_INFO=$(file -b --mime-type "${FILE}" | sed 's/ //g')
-    case "${FILE_INFO}" in
-    text/*)
-      ;;
-    application/xml)
-      ;;
-    *)
-      echo "[skip] ${FILE_INFO} - ${FILE}" >&2
-      continue
-      ;;
-    esac
-    # 行番号付きで検索した結果をフィルタする
-    ( eval "cat '${FILE}' | grep -n '.*' ${FILTER_IN_FILE_COMMAND}" ) > ${TMP_FILE}
-    COUNT=$(cat ${TMP_FILE} | wc -l | sed 's/ //g')
-    if [ ${COUNT} -ne 0 ]; then
-      # ファイル検索結果が存在する
-      RETCODE_FILE=0
-      # ファイルを分解して色付け
-      if [ "${GREP_COLOR}" != "" ]; then
-        # 行番号に色がつかないよう分解する
-        sed 's#^\([^:]*\):.*$#\1#' ${TMP_FILE} > ${TMP_FILE_1}
-        ( eval "sed 's#^[^:]*:\(.*\)\$#\1#' '${TMP_FILE}' ${FILTER_COLOR_COMMAND}" ) > ${TMP_FILE_2}
-        if [ $(cat ${TMP_FILE_1} | wc -l | sed 's/ //g') = $(cat ${TMP_FILE_2} | wc -l | sed 's/ //g') ]; then
-          paste -d: ${TMP_FILE_1} ${TMP_FILE_2} > ${TMP_FILE}
-        else
-          # FIXME grep --color=always -e OR -e OR の場合、segfaultで落ちる...
-          private.console_error "色付けに失敗[${FILE}]"
-        fi
-      fi
-      # 検索条件に該当する行あり
-      private.output_file_info "${FILE}" "${TMP_FILE}" "${GREP_COLOR}" >> ${OUTPUT_FILE}
-    fi
-  else
-    # ファイル内検索なし
-    private.output_path_info "${FILE}" "${GREP_COLOR}" >> ${OUTPUT_PATH_FILE}
-  fi
-done
+
+# 中間ファイル
+export TMP_DIR=/tmp/grepper.$$
+# 初期化
+mkdir -p ${TMP_DIR}
+# 最終的な結果が格納されるファイル
+OUTPUT_PATH_FILE=${TMP_DIR}/grepper.path.csv
+OUTPUT_FILE=${TMP_DIR}/grepper.file.csv
+cat /dev/null > ${OUTPUT_PATH_FILE}
+cat /dev/null > ${OUTPUT_FILE}
+# 処理終了時に削除
+trap "if [ -d ${TMP_DIR} ]; then rm -r ${TMP_DIR}; fi" EXIT
+
+# 検索実施
+private.grepper 0 "${OUTPUT_PATH_FILE}" "${OUTPUT_FILE}" "${FIND_PATHS}"
+RETCODE=$?
+
 # 結果表示
 private.console
 if [ "${FILTER_IN_FILE_COMMAND}" = "" ]; then
@@ -543,17 +626,16 @@ if [ "${FILTER_IN_FILE_COMMAND}" = "" ]; then
   if [ "${QUIET}" != "true" ]; then
     cat ${OUTPUT_PATH_FILE}
   fi
-  RETCODE=${RETCODE_PATH}
   HIT_COUNT=$(cat ${OUTPUT_PATH_FILE} | wc -l | sed 's/ //g') 
 else
   private.console "== file ==================================================================="
   if [ "${QUIET}" != "true" ]; then
     cat ${OUTPUT_FILE}
   fi
-  RETCODE=${RETCODE_FILE}
   HIT_COUNT=$(cat ${OUTPUT_FILE} | wc -l | sed 's/ //g') 
 fi
 private.console "== summary ================================================================"
 private.console "該当件数: "${HIT_COUNT}
 private.console "==========================================================================="
+
 exit ${RETCODE}

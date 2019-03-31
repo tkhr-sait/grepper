@@ -1,0 +1,19 @@
+#!/bin/bash
+
+_grepper(){
+  COMMAND=$(which ${COMP_WORDS[0]})
+  if [ -L ${COMMAND} ]; then
+    COMMAND=$(readlink ${COMMAND})
+  fi
+  
+	# 長い形式の引数のみ抽出して補完候補とする
+  COMMANDS=$(grep -v '(' ${COMMAND} | grep '  -.*)' | sed -e 's/)//g' -e 's/-.*|//g' -e 's/ //g'| tr '\n' " ")
+
+  COMMANDS="${COMMANDS} "$(ls -a)
+  
+	local cur=${COMP_WORDS[COMP_CWORD]}
+  COMPREPLY=( $(compgen -W "${COMMANDS}" -- ${cur}) )
+}
+
+# 補完設定
+complete -F _grepper grepper
